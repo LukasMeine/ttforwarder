@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  stockmafia-bot:
+    build:
+      context: .
+    container_name: stockmafia-lowscanner
+    restart: unless-stopped
+    command: ["node", "bot.js"]
+    env_file:
+      - .env 
