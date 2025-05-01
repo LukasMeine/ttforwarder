@@ -1,309 +1,253 @@
-# pip install -U discord.py-self python-dotenv
-import os
-import re
-import random
-import asyncio
-import time
+# bot.py  – discord.py-self – rebuild-on-failure – burp-token fix
+import os, re, random, asyncio, time, sys, socket, ssl
 from dotenv import load_dotenv
-import discord
+
+import discord                       # discord.py-self
+from discord import HTTPException
 from discord.ext import commands, tasks
+from discord.http import HTTPClient
+from curl_cffi.curl import CurlError
+import aiohttp
 
 load_dotenv()
 
-# ── CONFIG ────────────────────────────────────────────────
-XACANNA_TOKEN      = os.getenv("XACANNA_TOKEN")
-CHADBRICK_TOKEN    = os.getenv("CHADBRICK_TOKEN")
-RICK_APP_ID        = int(os.getenv("RICK_APP_ID"))
-DEJ_ID             = 303754867044777985
+# ── CONFIG ──────────────────────────────────────────────
+TOK_XACANNA   = os.getenv("XACANNA_TOKEN")
+TOK_CHADBRICK = os.getenv("CHADBRICK_TOKEN")
+RICK_APP_ID   = int(os.getenv("RICK_APP_ID"))
 
-COMMAND_CHANNEL_ID = int(os.getenv("COMMAND_CHANNEL_ID"))
-TT_CHANNEL_ID      = int(os.getenv("TT_CHANNEL_ID"))
-X_CHANNEL_ID       = int(os.getenv("X_CHANNEL_ID"))
-CALL_CHANNEL_ID    = int(os.getenv("CALL_CHANNEL_ID"))
-BURP_CHANNEL_ID    = int(os.getenv("BURP_CHANNEL_ID"))
-GLOBAL_CHANNEL_ID  = int(os.getenv("GLOBAL_CHANNEL_ID"))
+CMD_CH     = int(os.getenv("COMMAND_CHANNEL_ID"))
+TT_CH_ID   = int(os.getenv("TT_CHANNEL_ID"))
+X_CH_ID    = int(os.getenv("X_CHANNEL_ID"))
+CALL_CH_ID = int(os.getenv("CALL_CHANNEL_ID"))
+BURP_CH_ID = int(os.getenv("BURP_CHANNEL_ID"))
+GL_CH_ID   = int(os.getenv("GLOBAL_CHANNEL_ID"))
 
-INTERVAL_SECONDS   = int(os.getenv("MONITOR_INTERVAL", "60"))
-BURP_INTERVAL      = int(os.getenv("BURP_INTERVAL", "60"))
-COMMAND_DELAY      = int(os.getenv("COMMAND_DELAY", "15"))
-COPY_DELAY_MIN     = int(os.getenv("COPY_DELAY_MIN", "3"))
-COPY_DELAY_MAX     = int(os.getenv("COPY_DELAY_MAX", "5"))
-BURP_COOLDOWN      = int(os.getenv("BURP_COOLDOWN", "600"))
+INTERVAL_SECONDS = int(os.getenv("MONITOR_INTERVAL", "60"))
+BURP_INTERVAL    = int(os.getenv("BURP_INTERVAL", "60"))
+COMMAND_DELAY    = int(os.getenv("COMMAND_DELAY", "15"))
+COPY_DELAY_MIN   = int(os.getenv("COPY_DELAY_MIN", "3"))
+COPY_DELAY_MAX   = int(os.getenv("COPY_DELAY_MAX", "5"))
+BURP_COOLDOWN    = int(os.getenv("BURP_COOLDOWN", "600"))
 
-# ── STATE & DEDUPE ────────────────────────────────────────
-isMonitoringTT       = True
-isMonitoringBurp     = True
-processed_tt_embeds  = set()
-processed_tweets     = set()
-processed_burp_embeds= set()
+# ── GLOBAL STATE ───────────────────────────────────────
+isMonitoringTT  = True
+isMonitoringBurp = True
+processed_tt_embeds, processed_tweets = set(), set()
 burp_cycle_processed = set()
-last_trending_time   = 0.0
-last_burp_time       = 0.0
+last_trending_time, last_burp_time = 0.0, 0.0
 
-# ── INTENTS (dynamic for compat) ─────────────────────────
-try:
-    intents = discord.Intents.default()
-    intents.message_content = True
-except AttributeError:
-    intents = None
+NET_ERR = (
+    discord.InvalidData, HTTPException, CurlError,
+    aiohttp.ClientError, OSError, socket.gaierror, ssl.SSLError,
+)
 
-# ── SELF-BOT INSTANCES ───────────────────────────────────
-bot_kwargs = {"command_prefix": "!", "self_bot": True}
-if intents:
-    bot_kwargs["intents"] = intents
+# clean URL / token regex
+TW_URL_RE = re.compile(r"(https?://twitter\.com/[^\s\)\]]+)")
+TOKEN_RE  = re.compile(r"(0x[a-fA-F0-9]{40}|[A-Za-z0-9]+)$")
 
-xacanna   = commands.Bot(**bot_kwargs)
-chadbrick = commands.Bot(**bot_kwargs)
-
-# placeholders to be filled in on_ready
-cmd_ch_tt   = None
-cmd_ch_burp = None
-tt_cmd      = None
-burp_cmd    = None
-
-# ── UTILITY ───────────────────────────────────────────────
+# ── UTILITIES ───────────────────────────────────────────
 async def safe_fetch_commands(ch):
     while True:
         try:
             return await ch.application_commands()
-        except ValueError as e:
-            if "invalid literal for int()" in str(e):
-                print("[RATE LIMIT] retrying fetch_commands in 1s…")
-                await asyncio.sleep(1)
-                continue
-            raise
+        except ValueError:
+            await asyncio.sleep(1)
 
-# ── XACANNA: schedule /tt & /burp ───────────────────────
-@xacanna.event
-async def on_ready():
-    global cmd_ch_tt, cmd_ch_burp, tt_cmd, burp_cmd
+def make_bot(label: str) -> commands.Bot:
+    bot = commands.Bot(command_prefix="!", self_bot=True)
+    bot.label = label
 
-    print(f"Xacanna ready as {xacanna.user}")
+    # ── READY ──────────────────────────────────────────
+    @bot.event
+    async def on_ready():
+        print(f"[{label}] ready as {bot.user}")
+        if label == "XACANNA" and not getattr(bot, "_tt_started", False):
+            _attach_tt_tasks(bot)
 
-    cmd_ch_tt   = await xacanna.fetch_channel(COMMAND_CHANNEL_ID)
-    cmd_ch_burp = await xacanna.fetch_channel(BURP_CHANNEL_ID)
+    # ── CHADBRICK-only handlers ───────────────────────
+    if label == "CHADBRICK":
 
-    # fetch both command lists in parallel
-    tt_task   = asyncio.create_task(safe_fetch_commands(cmd_ch_tt))
-    burp_task = asyncio.create_task(safe_fetch_commands(cmd_ch_burp))
-    tt_list, burp_list = await asyncio.gather(tt_task, burp_task)
+        @bot.event
+        async def on_message_edit(_, after):
+            if (
+                isMonitoringBurp and after.author.id == RICK_APP_ID
+                and after.channel.id == BURP_CH_ID and after.embeds
+            ):
+                for line in (after.embeds[0].description or "").splitlines():
+                    if "Δ" not in line:
+                        continue
+                    url_m = re.search(r"https?://\S+", line)
+                    if not url_m:
+                        continue
 
-    tt_cmd   = discord.utils.get(tt_list,   name="tt")
-    burp_cmd = discord.utils.get(burp_list, name="burp")
+                    raw = url_m.group(0).rstrip("/")                       # drop trailing '/'
+                    raw = re.sub(r"[^A-Za-z0-9x]+$", "", raw)              # drop trailing symbols
+                    tok_m = TOKEN_RE.search(raw)
+                    if not tok_m:
+                        continue
+                    token = tok_m.group(1)
 
-    print("TT cmds :", [c.name for c in tt_list])
-    print("Burp cmds:", [c.name for c in burp_list])
+                    if token in burp_cycle_processed:
+                        continue
 
-    if not tt_cmd or not burp_cmd:
-        print("❌ couldn’t find /tt and/or /burp")
-        return
+                    pct = float(re.search(r"Δ\s*([-.\d]+)%", line).group(1))
+                    if pct < 0:
+                        continue
+
+                    burp_cycle_processed.add(token)
+                    print(f"Burping token: {token} ({pct}%)")
+                    await asyncio.sleep(random.uniform(COPY_DELAY_MIN, COPY_DELAY_MAX))
+                    await bot.get_channel(GL_CH_ID).send(token)
+
+        @bot.event
+        async def on_message(msg: discord.Message):
+            global isMonitoringTT, isMonitoringBurp
+            if msg.author.id == bot.user.id:
+                return
+
+            txt = msg.content.strip().lower()
+
+            # TT control
+            if msg.channel.id == TT_CH_ID:
+                if txt == "tt start":
+                    isMonitoringTT = True
+                    return await msg.channel.send("TT on")
+                if txt == "tt stop":
+                    isMonitoringTT = False
+                    return await msg.channel.send("TT off")
+                if txt.startswith("tt config"):
+                    _, _, cd, dmin, dmax = txt.split()[:5]
+                    globals().update(
+                        COMMAND_DELAY=int(cd),
+                        COPY_DELAY_MIN=int(dmin),
+                        COPY_DELAY_MAX=int(dmax),
+                    )
+                    return await msg.channel.send("TT config updated")
+
+            # Burp control
+            if msg.channel.id == BURP_CH_ID:
+                if txt == "burp start":
+                    isMonitoringBurp = True
+                    return await msg.channel.send("Burp on")
+                if txt == "burp stop":
+                    isMonitoringBurp = False
+                    return await msg.channel.send("Burp off")
+                if txt.startswith("burp config"):
+                    globals().update(BURP_COOLDOWN=int(txt.split()[2]))
+                    return await msg.channel.send("Burp cooldown updated")
+
+            # TT-embed forwarding
+            if (
+                isMonitoringTT and msg.author.id == RICK_APP_ID
+                and msg.channel.id == CMD_CH and msg.embeds
+            ):
+                if msg.id in processed_tt_embeds:
+                    return
+                processed_tt_embeds.add(msg.id)
+                for line in (msg.embeds[0].description or "").splitlines():
+                    m = TW_URL_RE.search(line)
+                    if not m:
+                        continue
+                    url = m.group(1)
+                    if url in processed_tweets:
+                        continue
+                    processed_tweets.add(url)
+                    print("Forwarding URL:", url)
+                    await asyncio.sleep(random.uniform(COPY_DELAY_MIN, COPY_DELAY_MAX))
+                    await bot.get_channel(X_CH_ID).send(url)
+                return
+
+            # Raw tweets
+            if msg.channel.id == TT_CH_ID and not msg.author.bot:
+                for m in TW_URL_RE.finditer(msg.content):
+                    url = m.group(1)
+                    if url in processed_tweets:
+                        continue
+                    processed_tweets.add(url)
+                    dest = CALL_CH_ID if re.search(r"\b0x[a-fA-F0-9]{40}\b", msg.content) else X_CH_ID
+                    print("Forwarding URL:", url)
+                    await asyncio.sleep(random.uniform(COPY_DELAY_MIN, COPY_DELAY_MAX))
+                    await bot.get_channel(dest).send(url)
+
+    return bot
+
+def _attach_tt_tasks(bot: commands.Bot):
+    bot._tt_started = True
+    global last_trending_time, last_burp_time
+
+    async def recreate_http():
+        old = bot.http
+        try: await old.close()
+        except Exception: pass
+        bot.http = HTTPClient(old.token)
+
+    @tasks.loop(seconds=INTERVAL_SECONDS)
+    async def tt_loop():
+        global last_trending_time
+        try:
+            if not isMonitoringTT or bot.is_closed():
+                return
+            if time.time() - last_trending_time < COMMAND_DELAY:
+                return
+            last_trending_time = time.time()
+
+            ch = await bot.fetch_channel(CMD_CH)
+            cmd = discord.utils.get(await safe_fetch_commands(ch), name="tt")
+            if cmd:
+                await cmd.__call__(channel=ch, guild=ch.guild)
+                print(f"[TT_LOOP] fired /tt in #{ch.name}")
+        except NET_ERR as e:
+            print(f"[TT_LOOP] REST {e!r} – recreate HTTP")
+            await recreate_http()
+
+    @tasks.loop(seconds=BURP_INTERVAL)
+    async def burp_loop():
+        global last_burp_time
+        try:
+            if not isMonitoringBurp or bot.is_closed():
+                return
+            if time.time() - last_burp_time < BURP_COOLDOWN:
+                return
+            last_burp_time = time.time()
+
+            ch = await bot.fetch_channel(BURP_CH_ID)
+            cmd = discord.utils.get(await safe_fetch_commands(ch), name="burp")
+            if cmd:
+                await cmd.__call__(channel=ch, guild=ch.guild)
+                print(f"[BURP_LOOP] fired /burp in #{ch.name}")
+        except NET_ERR as e:
+            print(f"[BURP_LOOP] REST {e!r} – recreate HTTP")
+            await recreate_http()
 
     tt_loop.start()
     burp_loop.start()
 
-@tasks.loop(seconds=INTERVAL_SECONDS)
-async def tt_loop():
-    global last_trending_time
-    if not isMonitoringTT or tt_cmd is None:
-        return
-    now = time.time()
-    if now - last_trending_time < COMMAND_DELAY:
-        return
-    last_trending_time = now
-    try:
-        await tt_cmd.__call__(channel=cmd_ch_tt, guild=cmd_ch_tt.guild)
-        print(f"[TT_LOOP] fired /tt in #{cmd_ch_tt.name}")
-    except Exception as e:
-        print(f"[TT_LOOP ERROR] {e!r}")
+# ── RUNNER: create new bot on any gateway failure ───────
+async def runner(token, label):
+    while True:
+        bot = make_bot(label)
+        try:
+            await bot.login(token)
+            print(f"[{label}] login OK")
+            await bot.connect(reconnect=True)
+        except (*NET_ERR,) as e:
+            print(f"[{label}] gateway/net {e!r} – rebuild in 5 s")
+            try: await bot.close()
+            except Exception: pass
+            await asyncio.sleep(5)
+        except discord.LoginFailure:
+            print(f"[{label}] bad token – abort")
+            sys.exit(1)
 
-@tasks.loop(seconds=BURP_INTERVAL)
-async def burp_loop():
-    global last_burp_time
-    if not isMonitoringBurp or burp_cmd is None:
-        return
-    now = time.time()
-    if now - last_burp_time < BURP_COOLDOWN:
-        return
-    last_burp_time = now
-    try:
-        await burp_cmd.__call__(channel=cmd_ch_burp, guild=cmd_ch_burp.guild)
-        print(f"[BURP_LOOP] fired /burp in #{cmd_ch_burp.name}")
-    except Exception as e:
-        print(f"[BURP_LOOP ERROR] {e!r}")
-
-# ── CHADBRICK: listen & forward ──────────────────────────
-@chadbrick.event
-async def on_ready():
-    print(f"Chadbrick ready as {chadbrick.user}")
-
-# just keep a Python set in memory
-burp_cycle_processed: set[str] = set()
-
-@chadbrick.event
-async def on_message_edit(before: discord.Message, after: discord.Message):
-    if not (
-        isMonitoringBurp
-        and after.author.id == RICK_APP_ID
-        and after.channel.id == BURP_CHANNEL_ID
-        and after.embeds
-    ):
-        return
-
-    lines = [l for l in (after.embeds[0].description or "").splitlines() if l.strip()]
-    stat_lines = [l for l in lines if "Δ" in l]
-
-    for stat in stat_lines:
-        url_m = re.search(r"https?://[^\)\s]+", stat)
-        if not url_m:
-            continue
-        token = url_m.group(0).rstrip("/").split("/")[-1]
-
-        # SKIP if we've already burped this token
-        if token in burp_cycle_processed:
-            continue
-
-        # parse percentage (if you need it)
-        pct_m = re.search(r"Δ\s*([-.\d]+)%", stat)
-        pct = float(pct_m.group(1)) if pct_m else 0.0
-
-        # your business rule: only burp if pct >= 0
-        if pct < 0:
-            continue
-
-        # mark as processed
-        burp_cycle_processed.add(token)
-
-        print(f"Burping token: {token} ({pct}%)")
-        await asyncio.sleep(random.uniform(COPY_DELAY_MIN, COPY_DELAY_MAX))
-        await chadbrick.get_channel(GLOBAL_CHANNEL_ID).send(token)
-
-
-
-@chadbrick.event
-async def on_message(msg: discord.Message):
-    global isMonitoringTT, isMonitoringBurp
-    global COMMAND_DELAY, COPY_DELAY_MIN, COPY_DELAY_MAX, BURP_COOLDOWN
-    global last_trending_time, last_burp_time
-
-    if msg.author.id == chadbrick.user.id:
-        return
-
-    txt = msg.content.strip().lower()
-
-    # TT control
-    if msg.channel.id == TT_CHANNEL_ID:
-        if txt == "tt start":
-            isMonitoringTT = True
-            return await msg.channel.send("TT monitoring started.")
-        if txt == "tt stop":
-            isMonitoringTT = False
-            return await msg.channel.send("TT monitoring stopped.")
-        if txt.startswith("tt config"):
-            parts = txt.split()
-            if len(parts) >= 5:
-                COMMAND_DELAY   = int(parts[2])
-                COPY_DELAY_MIN  = int(parts[3])
-                COPY_DELAY_MAX  = int(parts[4])
-                return await msg.channel.send(
-                    f"TT delays set: parse {COMMAND_DELAY}s, copy {COPY_DELAY_MIN}-{COPY_DELAY_MAX}s"
-                )
-
-    # Burp control
-    if msg.channel.id == BURP_CHANNEL_ID:
-        if txt == "burp start":
-            isMonitoringBurp = True
-            return await msg.channel.send("Burp monitoring started.")
-        if txt == "burp stop":
-            isMonitoringBurp = False
-            return await msg.channel.send("Burp monitoring stopped.")
-        if txt.startswith("burp config"):
-            parts = txt.split()
-            if len(parts) >= 3:
-                BURP_COOLDOWN = int(parts[2])
-                return await msg.channel.send(f"Burp cooldown set to {BURP_COOLDOWN}s")
-
-    # Handle /tt embeds
-    if (isMonitoringTT
-        and msg.author.id == RICK_APP_ID
-        and msg.channel.id == COMMAND_CHANNEL_ID
-        and msg.embeds):
-        emb = msg.embeds[0]
-        if msg.id not in processed_tt_embeds:
-            now_ts = time.time()
-            last_trending_time = now_ts
-            processed_tt_embeds.add(msg.id)
-
-            lines = [l for l in (emb.description or "").splitlines() if l.strip()]
-            for line in lines:
-                m = re.search(r"https?://twitter\.com/[^\s)]+", line)
-                if not m:
-                    continue
-                url = m.group(0)
-                if url in processed_tweets:
-                    print("Skipping duplicate URL:", url)
-                    continue
-                processed_tweets.add(url)
-                print("Forwarding URL:", url)
-                await asyncio.sleep(random.uniform(COPY_DELAY_MIN, COPY_DELAY_MAX))
-                await chadbrick.get_channel(X_CHANNEL_ID).send(url)
-        return
-
-    if not (isMonitoringBurp
-            and msg.author.id == RICK_APP_ID
-            and msg.channel.id == BURP_CHANNEL_ID):
-        return
-
-    print(msg.embeds[0])
-    lines = [l for l in (msg.embeds[0].description or "").splitlines() if l.strip()]
-    print(lines)
-    # extract only lines containing Δ
-    stat_lines = [l for l in lines if "Δ" in l]
-
-    for stat in stat_lines:
-        # pull the URL out of this same stat line
-        url_m = re.search(r"https?://\S+", stat)
-        if not url_m:
-            continue
-        full_url = url_m.group(0).rstrip(")")
-        # capture final path segment of alphanumeric chars only
-        tok_m = re.search(r"/([A-Za-z0-9]+)$", full_url)
-        if not tok_m:
-            continue
-        token = tok_m.group(1)
-
-        pct_m = re.search(r"Δ\s*([-.\d]+)%", stat)
-        pct = float(pct_m.group(1)) if pct_m else 0.0
-
-        if token in burp_cycle_processed and pct >= 0:
-            continue
-
-        burp_cycle_processed.add(token)
-        print(f"Burping token: {token} ({pct}%)")
-        await asyncio.sleep(random.uniform(COPY_DELAY_MIN, COPY_DELAY_MAX))
-        await chadbrick.get_channel(GLOBAL_CHANNEL_ID).send(token)
-
-    # Forward raw tweets
-    if msg.channel.id == TT_CHANNEL_ID and not msg.author.bot:
-        for m in re.finditer(r"https?://twitter\.com/[\w]+/status/\d+", msg.content):
-            url = m.group(0)
-            if url in processed_tweets:
-                print("Skipping duplicate URL:", url)
-                continue
-            processed_tweets.add(url)
-            print("Forwarding URL:", url)
-            if (re.search(r"\b0x[a-fA-F0-9]{40}\b", msg.content)
-                or re.search(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b", msg.content)):
-                print("On-chain address → #call only")
-                await chadbrick.get_channel(CALL_CHANNEL_ID).send(url)
-            else:
-                await asyncio.sleep(random.uniform(COPY_DELAY_MIN, COPY_DELAY_MAX))
-                await chadbrick.get_channel(X_CHANNEL_ID).send(url)
-
-# ── RUN BOTH BOTS ────────────────────────────────────────
 async def main():
     await asyncio.gather(
-        xacanna.start(XACANNA_TOKEN),
-        chadbrick.start(CHADBRICK_TOKEN)
+        runner(TOK_XACANNA, "XACANNA"),
+        runner(TOK_CHADBRICK, "CHADBRICK"),
     )
 
-asyncio.run(main())
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Ctrl-C – exiting")
