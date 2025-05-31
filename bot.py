@@ -6,6 +6,7 @@
 #   restarts container if loops hang
 
 import os, re, random, asyncio, time, sys, socket, ssl, inspect, logging, pathlib, datetime
+from datetime import UTC
 from dotenv import load_dotenv
 
 import discord
@@ -24,7 +25,7 @@ HB_PATH = pathlib.Path("/tmp/ttforwarder_heartbeat")
 def update_hb() -> None:
     """Touch heartbeat file with current UTC timestamp."""
     try:
-        HB_PATH.write_text(datetime.datetime.utcnow().isoformat())
+        HB_PATH.write_text(datetime.datetime.now(UTC).isoformat())
     except Exception:
         pass  # container continues even if /tmp is temporarily read-only
 
@@ -44,22 +45,27 @@ for noisy in ("discord", "aiohttp", "asyncio", "curl_cffi"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
 # ── CONFIG ───────────────────────────────────────────────────────────────
-TOK_XACANNA   = os.getenv("XACANNA_TOKEN")
-TOK_CHADBRICK = os.getenv("CHADBRICK_TOKEN")
-RICK_APP_ID   = int(os.getenv("RICK_APP_ID"))
+TOK_TRIBEIQ     = os.getenv("TOK_TRIBEIQ", "")
+TOK_EYESINTHEHOOK = os.getenv("TOK_EYESINTHEHOOK", "")
+TOK_HOODNARRATOR = os.getenv("TOK_HOODNARRATOR", "")
+TOK_READYTOSPY  = os.getenv("TOK_READYTOSPY", "")
+RICK_APP_ID     = int(os.getenv("RICK_APP_ID"))
 
-CMD_CH     = int(os.getenv("COMMAND_CHANNEL_ID"))
-TT_CH_ID   = int(os.getenv("TT_CHANNEL_ID"))
-X_CH_ID    = int(os.getenv("X_CHANNEL_ID"))
-CALL_CH_ID = int(os.getenv("CALL_CHANNEL_ID"))
-BURP_CH_ID = int(os.getenv("BURP_CHANNEL_ID"))
-GL_CH_ID   = int(os.getenv("GLOBAL_CHANNEL_ID"))
+CMD_CH     = int(os.getenv("CMD_CH"))
+TT_CH_ID   = int(os.getenv("TT_CH_ID"))
+X_CH_ID    = int(os.getenv("X_CH_ID"))
+CALL_CH_ID = int(os.getenv("CALL_CH_ID"))
+BURP_CH_ID = int(os.getenv("BURP_CH_ID"))
+GL_CH_ID   = int(os.getenv("GL_CH_ID"))
 
+# These are kept for backward compatibility but no longer used directly
 INTERVAL_SECONDS = int(os.getenv("MONITOR_INTERVAL", "60"))
 BURP_INTERVAL    = int(os.getenv("BURP_INTERVAL", "60"))
-COMMAND_DELAY    = int(os.getenv("COMMAND_DELAY", "15"))
-COPY_DELAY_MIN   = int(os.getenv("COPY_DELAY_MIN", "3"))
-COPY_DELAY_MAX   = int(os.getenv("COPY_DELAY_MAX", "5"))
+
+# Increased delays and more variation for command-based bots
+COMMAND_DELAY    = int(os.getenv("COMMAND_DELAY", "30"))  # Increased from 15 to 30
+COPY_DELAY_MIN   = int(os.getenv("COPY_DELAY_MIN", "5"))  # Increased from 3 to 5
+COPY_DELAY_MAX   = int(os.getenv("COPY_DELAY_MAX", "15")) # Increased from 5 to 15
 BURP_COOLDOWN    = int(os.getenv("BURP_COOLDOWN", "600"))
 
 FAIL_THRESHOLD   = 3   # after N consecutive REST failures → os._exit(1)
@@ -70,6 +76,8 @@ isMonitoringBurp = True
 processed_tt_embeds, processed_tweets = set(), set()
 burp_cycle_processed = set()
 last_trending_time, last_burp_time = 0.0, 0.0
+tt_bot_selected = None
+burp_bot_selected = None
 
 ALLOWED_AUTHORS = {
     219212900743512065, # Simple
@@ -85,12 +93,43 @@ NET_ERR = (
 TW_URL_RE = re.compile(r"(https?://twitter\.com/[^\s\)\]]+)")
 TOKEN_RE  = re.compile(r"(0x[a-fA-F0-9]{40}|[A-Za-z0-9]+)$")
 
-async def safe_fetch_commands(ch):
-    while True:
+async def safe_command_call(cmd, channel, guild, max_retries=3):
+    """Safely call a Discord command with retry mechanism."""
+    retries = 0
+    last_error = None
+
+    while retries < max_retries:
+        try:
+            return await cmd.__call__(channel=channel, guild=guild)
+        except NET_ERR as e:
+            last_error = e
+            retries += 1
+            backoff = min(2 ** retries, 60)  # Exponential backoff, max 60 seconds
+            log.warning("[COMMAND_CALL] %r, retrying in %s seconds (%s/%s)", 
+                       e, backoff, retries, max_retries)
+            await asyncio.sleep(backoff)
+
+    # If we've exhausted retries, raise the last exception
+    log.error("[COMMAND_CALL] Failed after %s retries: %r", max_retries, last_error)
+    raise last_error
+
+async def safe_fetch_commands(ch, max_retries=5):
+    retries = 0
+    while retries < max_retries:
         try:
             return await ch.application_commands()
         except ValueError:
             await asyncio.sleep(1)
+        except NET_ERR:
+            retries += 1
+            backoff = min(2 ** retries, 60)  # Exponential backoff, max 60 seconds
+            log.warning("[FETCH_COMMANDS] Network error, retrying in %s seconds (%s/%s)", 
+                       backoff, retries, max_retries)
+            await asyncio.sleep(backoff)
+
+    # If we've exhausted retries, raise the last exception
+    log.error("[FETCH_COMMANDS] Failed after %s retries", max_retries)
+    return []  # Return empty list as fallback
 
 # ── BOT FACTORY ───────────────────────────────────────────────────────────
 def make_bot(label: str) -> commands.Bot:
@@ -99,13 +138,42 @@ def make_bot(label: str) -> commands.Bot:
 
     @bot.event
     async def on_ready():
+        global tt_bot_selected, burp_bot_selected
         log.info("[%s] ready as %s", label, bot.user)
         update_hb()                       # first heartbeat
-        if label == "XACANNA" and not getattr(bot, "_tt_started", False):
-            _attach_tt_tasks(bot)
 
-    # ── CHADBRICK handlers (burp + tweet forward) ──────────────────────
-    if label == "CHADBRICK":
+        # Randomly select one bot for TT tasks
+        if label in ["TRIBEIQ", "EYESINTHEHOOK"] and not getattr(bot, "_tt_started", False):
+            if tt_bot_selected is None:
+                # First bot to come online gets a 50% chance
+                if random.random() < 0.5:
+                    tt_bot_selected = label
+                    _attach_tt_tasks(bot)
+                    log.info("[%s] selected for TT tasks", label)
+            elif tt_bot_selected is None and (label == "TRIBEIQ" or label == "EYESINTHEHOOK"):
+                # If no bot was selected yet and this is the second bot, select it
+                tt_bot_selected = label
+                _attach_tt_tasks(bot)
+                log.info("[%s] selected for TT tasks (default)", label)
+
+        # Randomly select one bot for BURP tasks
+        if label in ["HOODNARRATOR", "READYTOSPY"] and not getattr(bot, "_burp_started", False):
+            if burp_bot_selected is None:
+                # First bot to come online gets a 50% chance
+                if random.random() < 0.5:
+                    burp_bot_selected = label
+                    bot._burp_started = True
+                    _attach_burp_tasks(bot)
+                    log.info("[%s] selected for BURP tasks", label)
+            elif burp_bot_selected is None and (label == "HOODNARRATOR" or label == "READYTOSPY"):
+                # If no bot was selected yet and this is the second bot, select it
+                burp_bot_selected = label
+                bot._burp_started = True
+                _attach_burp_tasks(bot)
+                log.info("[%s] selected for BURP tasks (default)", label)
+
+    # ── CHADBRICK/HOODNARRATOR/READYTOSPY handlers (burp + tweet forward) ──────────────────────
+    if label in ["HOODNARRATOR", "READYTOSPY"]:
 
         @bot.event
         async def on_message_edit(_, after):
@@ -160,7 +228,8 @@ def make_bot(label: str) -> commands.Bot:
                     else:
                         log.info("Burping new token: %s (%.1f%%)", token, pct)
 
-                    await asyncio.sleep(random.uniform(COPY_DELAY_MIN, COPY_DELAY_MAX))
+                    # Add variation between 1 and 15 seconds
+                    await asyncio.sleep(random.uniform(1, 15))
                     await bot.get_channel(GL_CH_ID).send(token)
             # — TT embed tweets —
             if isMonitoringTT and after.author.id == RICK_APP_ID and after.channel.id == CMD_CH:
@@ -180,7 +249,8 @@ def make_bot(label: str) -> commands.Bot:
                         continue
                     processed_tweets.add(url)
                     log.info("Forwarding tweet: %s", url)
-                    await asyncio.sleep(random.uniform(COPY_DELAY_MIN, COPY_DELAY_MAX))
+                    # Add variation between 1 and 15 seconds
+                    await asyncio.sleep(random.uniform(1, 15))
                     await bot.get_channel(X_CH_ID).send(url)
                 return None
             return None
@@ -274,7 +344,8 @@ def make_bot(label: str) -> commands.Bot:
                     else:
                         log.info("Burping new token: %s (%.1f%%)", token, pct)
 
-                    await asyncio.sleep(random.uniform(COPY_DELAY_MIN, COPY_DELAY_MAX))
+                    # Add variation between 1 and 15 seconds
+                    await asyncio.sleep(random.uniform(1, 15))
                     await bot.get_channel(GL_CH_ID).send(token)
 
                 return None
@@ -300,7 +371,8 @@ def make_bot(label: str) -> commands.Bot:
                         continue
                     processed_tweets.add(url)
                     log.info("Forwarding tweet: %s", url)
-                    await asyncio.sleep(random.uniform(COPY_DELAY_MIN, COPY_DELAY_MAX))
+                    # Add variation between 1 and 15 seconds
+                    await asyncio.sleep(random.uniform(1, 15))
                     await bot.get_channel(X_CH_ID).send(url)
                 return None
 
@@ -317,7 +389,8 @@ def make_bot(label: str) -> commands.Bot:
                     cname = "CALL" if dest == CALL_CH_ID else "X"
                     log.info("Forwarding tweet to %s: %s", cname, url)
 
-                    await asyncio.sleep(random.uniform(COPY_DELAY_MIN, COPY_DELAY_MAX))
+                    # Add variation between 1 and 15 seconds
+                    await asyncio.sleep(random.uniform(1, 15))
                     await bot.get_channel(dest).send(url)
                     return None
                 return None
@@ -325,10 +398,8 @@ def make_bot(label: str) -> commands.Bot:
     return bot
 
 # ── TASKS & RECOVERY ──────────────────────────────────────────────────────
-def _attach_tt_tasks(bot: commands.Bot):
-    bot._tt_started = True
-    global last_trending_time, last_burp_time
-
+def _recreate_http(bot: commands.Bot):
+    """Helper function to recreate the HTTP client."""
     async def recreate_http():
         old, token = bot.http, bot.http.token
         connector  = None if getattr(old, "connector", None) in (None, MISSING) else old.connector
@@ -336,9 +407,10 @@ def _attach_tt_tasks(bot: commands.Bot):
         try: await old.close()
         except Exception: pass
 
-        has_loop = "loop" in inspect.signature(HTTPClient.__init__).parameters
-        new_http = HTTPClient(*(bot.loop,) if has_loop else tuple(),
-                              connector=connector, proxy=proxy, proxy_auth=proxy_auth)
+        # Initialize HTTPClient without the loop parameter as it's no longer accepted
+        new_http = HTTPClient(proxy=proxy, proxy_auth=proxy_auth)
+        if connector is not None:
+            new_http.connector = connector
         await new_http.static_login(token)
 
         bot.http = new_http
@@ -346,26 +418,63 @@ def _attach_tt_tasks(bot: commands.Bot):
         if hasattr(bot, "_state"):
             bot._state.http = new_http
 
-    tt_fails = burp_fails = 0
+    return recreate_http
 
-    @tasks.loop(seconds=INTERVAL_SECONDS)
+def _attach_tt_tasks(bot: commands.Bot):
+    """Attach trending topics tasks to the bot."""
+    bot._tt_started = True
+    global last_trending_time
+
+    recreate_http = _recreate_http(bot)
+    tt_fails = 0
+    # Store the current interval and variation
+    current_interval = random.choice([60, 180, 300])
+    current_variation = random.uniform(0.1, 2.0)
+
+    @tasks.loop(seconds=1)  # We'll handle the interval manually
     async def tt_loop():
-        nonlocal tt_fails
+        nonlocal tt_fails, current_interval, current_variation
         global last_trending_time
         try:
             if not isMonitoringTT or bot.is_closed():
                 return
-            if time.time() - last_trending_time < COMMAND_DELAY:
-                return
-            last_trending_time = time.time()
 
-            ch = await bot.fetch_channel(CMD_CH)
-            cmd = discord.utils.get(await safe_fetch_commands(ch), name="tt")
-            if cmd:
-                await cmd.__call__(channel=ch, guild=ch.guild)
-                log.info("[TT_LOOP] fired /tt in #%s", ch.name)
-            tt_fails = 0
-            update_hb()                                   # successful loop
+            current_time = time.time()
+            # Log current values for debugging
+            log.debug("[TT_LOOP] Debug values: last_trending_time=%.2f, current_time=%.2f, diff=%.2f, threshold=%d+%.2f",
+                     last_trending_time, current_time, current_time - last_trending_time, current_interval, current_variation)
+
+            if current_time - last_trending_time < COMMAND_DELAY:
+                log.debug("[TT_LOOP] Skipping due to COMMAND_DELAY: diff=%.2f < %d", 
+                         current_time - last_trending_time, COMMAND_DELAY)
+                return
+
+            # If this is the first run or enough time has passed since last run
+            time_diff = current_time - last_trending_time
+            threshold = current_interval + current_variation
+            if last_trending_time == 0 or time_diff >= threshold:
+                log.debug("[TT_LOOP] Condition met: last_trending_time=%s, time_diff=%.2f, threshold=%.2f", 
+                         "0" if last_trending_time == 0 else "%.2f" % last_trending_time, time_diff, threshold)
+                # Execute the command
+                ch = await bot.fetch_channel(CMD_CH)
+                cmd = discord.utils.get(await safe_fetch_commands(ch), name="tt")
+                if cmd:
+                    # Log the interval that was used
+                    log.info("[TT_LOOP] fired /tt in #%s with interval %ds+%.2fs", ch.name, current_interval, current_variation)
+                    await safe_command_call(cmd, ch, ch.guild)
+
+                    # Update the last trending time
+                    last_trending_time = current_time
+
+                    # Select a new interval and variation for the next run
+                    current_interval = random.choice([180, 300, 480])
+                    current_variation = random.uniform(0.1, 2.0)  # Add 0.1 to 2.0 seconds of variation
+
+                    tt_fails = 0
+                    update_hb()                                   # successful loop
+            else:
+                log.debug("[TT_LOOP] Condition not met: time_diff=%.2f < threshold=%.2f, waiting...", 
+                         time_diff, threshold)
         except NET_ERR as e:
             tt_fails += 1
             log.warning("[TT_LOOP] REST %r — recreate HTTP (%s/%s)", e, tt_fails, FAIL_THRESHOLD)
@@ -374,24 +483,61 @@ def _attach_tt_tasks(bot: commands.Bot):
                 log.critical("[TT_LOOP] %s fails — hard exit", FAIL_THRESHOLD)
                 os._exit(1)
 
-    @tasks.loop(seconds=BURP_INTERVAL)
+    tt_loop.start()
+
+def _attach_burp_tasks(bot: commands.Bot):
+    """Attach burp tasks to the bot."""
+    bot._burp_started = True
+    global last_burp_time
+
+    recreate_http = _recreate_http(bot)
+    burp_fails = 0
+    # Store the current variation
+    current_variation = random.uniform(5.0, 30.0)
+
+    @tasks.loop(seconds=1)  # We'll handle the interval manually
     async def burp_loop():
-        nonlocal burp_fails
+        nonlocal burp_fails, current_variation
         global last_burp_time
         try:
             if not isMonitoringBurp or bot.is_closed():
                 return
-            if time.time() - last_burp_time < BURP_COOLDOWN:
-                return
-            last_burp_time = time.time()
 
-            ch = await bot.fetch_channel(BURP_CH_ID)
-            cmd = discord.utils.get(await safe_fetch_commands(ch), name="burp")
-            if cmd:
-                await cmd.__call__(channel=ch, guild=ch.guild)
-                log.info("[BURP_LOOP] fired /burp in #%s", ch.name)
-            burp_fails = 0
-            update_hb()                                   # successful loop
+            current_time = time.time()
+            # Log current values for debugging
+            log.debug("[BURP_LOOP] Debug values: last_burp_time=%.2f, current_time=%.2f, diff=%.2f, threshold=%d+%.2f",
+                     last_burp_time, current_time, current_time - last_burp_time, BURP_COOLDOWN, current_variation)
+
+            if current_time - last_burp_time < BURP_COOLDOWN:
+                log.debug("[BURP_LOOP] Skipping due to BURP_COOLDOWN: diff=%.2f < %d", 
+                         current_time - last_burp_time, BURP_COOLDOWN)
+                return
+
+            # Check if enough time has passed with the current variation
+            time_diff = current_time - last_burp_time
+            threshold = BURP_COOLDOWN + current_variation
+            if last_burp_time == 0 or time_diff >= threshold:
+                log.debug("[BURP_LOOP] Condition met: last_burp_time=%s, time_diff=%.2f, threshold=%.2f", 
+                         "0" if last_burp_time == 0 else "%.2f" % last_burp_time, time_diff, threshold)
+                # Execute the command
+                ch = await bot.fetch_channel(BURP_CH_ID)
+                cmd = discord.utils.get(await safe_fetch_commands(ch), name="burp")
+                if cmd:
+                    # Log the cooldown that was used
+                    log.info("[BURP_LOOP] fired /burp in #%s with cooldown %ds+%.2fs", ch.name, BURP_COOLDOWN, current_variation)
+                    await safe_command_call(cmd, ch, ch.guild)
+
+                    # Update the last burp time
+                    last_burp_time = current_time
+
+                    # Select a new variation for the next run
+                    current_variation = random.uniform(5.0, 30.0)  # Add 5 to 30 seconds of variation
+
+                    burp_fails = 0
+                    update_hb()                                   # successful loop
+            else:
+                log.debug("[BURP_LOOP] Condition not met: time_diff=%.2f < threshold=%.2f, waiting...", 
+                         time_diff, threshold)
         except NET_ERR as e:
             burp_fails += 1
             log.warning("[BURP_LOOP] REST %r — recreate HTTP (%s/%s)", e, burp_fails, FAIL_THRESHOLD)
@@ -400,7 +546,6 @@ def _attach_tt_tasks(bot: commands.Bot):
                 log.critical("[BURP_LOOP] %s fails — hard exit", FAIL_THRESHOLD)
                 os._exit(1)
 
-    tt_loop.start()
     burp_loop.start()
 
 # ── RUNNER loop ───────────────────────────────────────────────────────────
@@ -420,8 +565,10 @@ async def runner(token, label):
 
 async def main():
     await asyncio.gather(
-        runner(TOK_XACANNA, "XACANNA"),
-        runner(TOK_CHADBRICK, "CHADBRICK"),
+        runner(TOK_TRIBEIQ, "TRIBEIQ"),
+        runner(TOK_EYESINTHEHOOK, "EYESINTHEHOOK"),
+        runner(TOK_HOODNARRATOR, "HOODNARRATOR"),
+        runner(TOK_READYTOSPY, "READYTOSPY"),
     )
 
 if __name__ == "__main__":
