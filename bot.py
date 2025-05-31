@@ -142,35 +142,18 @@ def make_bot(label: str) -> commands.Bot:
         log.info("[%s] ready as %s", label, bot.user)
         update_hb()                       # first heartbeat
 
-        # Randomly select one bot for TT tasks
-        if label in ["TRIBEIQ", "EYESINTHEHOOK"] and not getattr(bot, "_tt_started", False):
-            if tt_bot_selected is None:
-                # First bot to come online gets a 50% chance
-                if random.random() < 0.5:
-                    tt_bot_selected = label
-                    _attach_tt_tasks(bot)
-                    log.info("[%s] selected for TT tasks", label)
-            elif tt_bot_selected is None and (label == "TRIBEIQ" or label == "EYESINTHEHOOK"):
-                # If no bot was selected yet and this is the second bot, select it
-                tt_bot_selected = label
-                _attach_tt_tasks(bot)
-                log.info("[%s] selected for TT tasks (default)", label)
+        # Only EYESINTHEHOOK should do the tt loop
+        if label == "EYESINTHEHOOK" and not getattr(bot, "_tt_started", False):
+            tt_bot_selected = label
+            _attach_tt_tasks(bot)
+            log.info("[%s] selected for TT tasks", label)
 
-        # Randomly select one bot for BURP tasks
-        if label in ["HOODNARRATOR", "READYTOSPY"] and not getattr(bot, "_burp_started", False):
-            if burp_bot_selected is None:
-                # First bot to come online gets a 50% chance
-                if random.random() < 0.5:
-                    burp_bot_selected = label
-                    bot._burp_started = True
-                    _attach_burp_tasks(bot)
-                    log.info("[%s] selected for BURP tasks", label)
-            elif burp_bot_selected is None and (label == "HOODNARRATOR" or label == "READYTOSPY"):
-                # If no bot was selected yet and this is the second bot, select it
-                burp_bot_selected = label
-                bot._burp_started = True
-                _attach_burp_tasks(bot)
-                log.info("[%s] selected for BURP tasks (default)", label)
+        # Only TRIBEIQ should do the burp loop
+        if label == "TRIBEIQ" and not getattr(bot, "_burp_started", False):
+            burp_bot_selected = label
+            bot._burp_started = True
+            _attach_burp_tasks(bot)
+            log.info("[%s] selected for BURP tasks", label)
 
     # ── CHADBRICK/HOODNARRATOR/READYTOSPY handlers (burp + tweet forward) ──────────────────────
     if label in ["HOODNARRATOR", "READYTOSPY"]:
