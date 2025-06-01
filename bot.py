@@ -76,8 +76,21 @@ isMonitoringBurp = True
 processed_tt_embeds, processed_tweets = set(), set()
 burp_cycle_processed = set()
 last_trending_time, last_burp_time = 0.0, 0.0
-tt_bot_selected = None
-burp_bot_selected = None
+
+# Role rotation tracking
+tt_command_bot = None  # Bot that sends /tt commands
+tt_scanner_bot = None  # Bot that scans and forwards tweets
+burp_command_bot = None  # Bot that sends /burp commands
+burp_scanner_bot = None  # Bot that scans and forwards burp tokens
+
+# Lists of available bots for each role
+tt_command_candidates = ["TRIBEIQ", "EYESINTHEHOOK"]  # Bots that can send /tt
+tt_scanner_candidates = ["HOODNARRATOR", "READYTOSPY"]  # Bots that can scan tweets
+burp_command_candidates = ["TRIBEIQ", "EYESINTHEHOOK"]  # Bots that can send /burp
+burp_scanner_candidates = ["HOODNARRATOR", "READYTOSPY"]  # Bots that can scan burp tokens
+
+# Track all active bots
+active_bots = set()
 
 ALLOWED_AUTHORS = {
     219212900743512065, # Simple
@@ -131,6 +144,93 @@ async def safe_fetch_commands(ch, max_retries=5):
     log.error("[FETCH_COMMANDS] Failed after %s retries", max_retries)
     return []  # Return empty list as fallback
 
+# ── ROLE ROTATION FUNCTIONS ───────────────────────────────────────────────
+def rotate_tt_roles():
+    """Rotate which bots handle TT commands and scanning."""
+    global tt_command_bot, tt_scanner_bot, active_bots
+
+    # Get available command candidates (excluding current scanner bot)
+    available_cmd_bots = [bot for bot in tt_command_candidates if bot in active_bots and bot != tt_scanner_bot]
+
+    # Get available scanner candidates (excluding current command bot)
+    available_scan_bots = [bot for bot in tt_scanner_candidates if bot in active_bots and bot != tt_command_bot]
+
+    # If we have available bots, rotate roles
+    if available_cmd_bots and available_scan_bots:
+        # If there's a current command bot, move to next in rotation
+        if tt_command_bot in available_cmd_bots:
+            idx = available_cmd_bots.index(tt_command_bot)
+            tt_command_bot = available_cmd_bots[(idx + 1) % len(available_cmd_bots)]
+        else:
+            tt_command_bot = available_cmd_bots[0]
+
+        # If there's a current scanner bot, move to next in rotation
+        if tt_scanner_bot in available_scan_bots:
+            idx = available_scan_bots.index(tt_scanner_bot)
+            tt_scanner_bot = available_scan_bots[(idx + 1) % len(available_scan_bots)]
+        else:
+            tt_scanner_bot = available_scan_bots[0]
+
+        log.info("[TT_ROTATION] New roles - Command: %s, Scanner: %s", tt_command_bot, tt_scanner_bot)
+    else:
+        log.warning("[TT_ROTATION] Not enough available bots for rotation")
+
+def rotate_burp_roles():
+    """Rotate which bots handle BURP commands and scanning."""
+    global burp_command_bot, burp_scanner_bot, active_bots
+
+    # Get available command candidates (excluding current scanner bot)
+    available_cmd_bots = [bot for bot in burp_command_candidates if bot in active_bots and bot != burp_scanner_bot]
+
+    # Get available scanner candidates (excluding current command bot)
+    available_scan_bots = [bot for bot in burp_scanner_candidates if bot in active_bots and bot != burp_command_bot]
+
+    # If we have available bots, rotate roles
+    if available_cmd_bots and available_scan_bots:
+        # If there's a current command bot, move to next in rotation
+        if burp_command_bot in available_cmd_bots:
+            idx = available_cmd_bots.index(burp_command_bot)
+            burp_command_bot = available_cmd_bots[(idx + 1) % len(available_cmd_bots)]
+        else:
+            burp_command_bot = available_cmd_bots[0]
+
+        # If there's a current scanner bot, move to next in rotation
+        if burp_scanner_bot in available_scan_bots:
+            idx = available_scan_bots.index(burp_scanner_bot)
+            burp_scanner_bot = available_scan_bots[(idx + 1) % len(available_scan_bots)]
+        else:
+            burp_scanner_bot = available_scan_bots[0]
+
+        log.info("[BURP_ROTATION] New roles - Command: %s, Scanner: %s", burp_command_bot, burp_scanner_bot)
+    else:
+        log.warning("[BURP_ROTATION] Not enough available bots for rotation")
+
+def initialize_roles_if_needed():
+    """Initialize roles if they haven't been set yet."""
+    global tt_command_bot, tt_scanner_bot, burp_command_bot, burp_scanner_bot, active_bots
+
+    # Initialize TT roles if needed
+    if (tt_command_bot is None or tt_scanner_bot is None) and len(active_bots) >= 2:
+        available_cmd_bots = [bot for bot in tt_command_candidates if bot in active_bots]
+        available_scan_bots = [bot for bot in tt_scanner_candidates if bot in active_bots]
+
+        if available_cmd_bots and available_scan_bots:
+            tt_command_bot = available_cmd_bots[0]
+            tt_scanner_bot = available_scan_bots[0]
+            log.info("[INIT_ROLES] TT roles initialized - Command: %s, Scanner: %s", 
+                    tt_command_bot, tt_scanner_bot)
+
+    # Initialize BURP roles if needed
+    if (burp_command_bot is None or burp_scanner_bot is None) and len(active_bots) >= 2:
+        available_cmd_bots = [bot for bot in burp_command_candidates if bot in active_bots]
+        available_scan_bots = [bot for bot in burp_scanner_candidates if bot in active_bots]
+
+        if available_cmd_bots and available_scan_bots:
+            burp_command_bot = available_cmd_bots[0]
+            burp_scanner_bot = available_scan_bots[0]
+            log.info("[INIT_ROLES] BURP roles initialized - Command: %s, Scanner: %s", 
+                    burp_command_bot, burp_scanner_bot)
+
 # ── BOT FACTORY ───────────────────────────────────────────────────────────
 def make_bot(label: str) -> commands.Bot:
     bot = commands.Bot(command_prefix="!", self_bot=True)
@@ -138,30 +238,36 @@ def make_bot(label: str) -> commands.Bot:
 
     @bot.event
     async def on_ready():
-        global tt_bot_selected, burp_bot_selected
+        global active_bots, tt_command_bot, burp_command_bot
         log.info("[%s] ready as %s", label, bot.user)
         update_hb()                       # first heartbeat
 
-        # Only EYESINTHEHOOK should do the tt loop
-        if label == "EYESINTHEHOOK" and not getattr(bot, "_tt_started", False):
-            tt_bot_selected = label
-            _attach_tt_tasks(bot)
-            log.info("[%s] selected for TT tasks", label)
+        # Add this bot to active bots
+        active_bots.add(label)
 
-        # Only TRIBEIQ should do the burp loop
-        if label == "TRIBEIQ" and not getattr(bot, "_burp_started", False):
-            burp_bot_selected = label
+        # Initialize roles if needed
+        initialize_roles_if_needed()
+
+        # Attach TT tasks if this bot is the current TT command bot
+        if label == tt_command_bot and not getattr(bot, "_tt_started", False):
+            _attach_tt_tasks(bot)
+            log.info("[%s] selected for TT command tasks", label)
+
+        # Attach BURP tasks if this bot is the current BURP command bot
+        if label == burp_command_bot and not getattr(bot, "_burp_started", False):
             bot._burp_started = True
             _attach_burp_tasks(bot)
-            log.info("[%s] selected for BURP tasks", label)
+            log.info("[%s] selected for BURP command tasks", label)
 
-    # ── CHADBRICK/HOODNARRATOR/READYTOSPY handlers (burp + tweet forward) ──────────────────────
-    if label in ["HOODNARRATOR", "READYTOSPY"]:
+    # ── Handlers for scanning bots ──────────────────────────────────────────────
+    # Check if this bot is assigned to scanner role for either TT or BURP
+    if True:  # We'll check the role inside the event handlers
 
         @bot.event
         async def on_message_edit(_, after):
             if (
                     isMonitoringBurp
+                    and label == burp_scanner_bot  # Only process if this bot is the burp scanner
                     and after.author.id == RICK_APP_ID
                     and after.channel.id == BURP_CH_ID
                     and after.embeds
@@ -215,8 +321,12 @@ def make_bot(label: str) -> commands.Bot:
                     await asyncio.sleep(random.uniform(1, 15))
                     await bot.get_channel(GL_CH_ID).send(token)
             # — TT embed tweets —
-            if isMonitoringTT and after.author.id == RICK_APP_ID and after.channel.id == CMD_CH:
-
+            if (
+                    isMonitoringTT 
+                    and label == tt_scanner_bot  # Only process if this bot is the tt scanner
+                    and after.author.id == RICK_APP_ID 
+                    and after.channel.id == CMD_CH
+            ):
                 if after.id in processed_tt_embeds:
                     log.debug("Skip embed %s — duplicate", after.id)
                     return None
@@ -231,7 +341,7 @@ def make_bot(label: str) -> commands.Bot:
                         log.debug("Skip tweet duplicate: %s", url)
                         continue
                     processed_tweets.add(url)
-                    log.info("Forwarding tweet: %s", url)
+                    log.info("[%s] Forwarding tweet: %s", label, url)
                     # Add variation between 1 and 15 seconds
                     await asyncio.sleep(random.uniform(1, 15))
                     await bot.get_channel(X_CH_ID).send(url)
@@ -282,6 +392,7 @@ def make_bot(label: str) -> commands.Bot:
             # — New Burp‐forwarding logic on fresh messages —
             if (
                     isMonitoringBurp
+                    and label == burp_scanner_bot  # Only process if this bot is the burp scanner
                     and msg.channel.id == BURP_CH_ID
                     and msg.author.id in ALLOWED_AUTHORS
                     and msg.embeds
@@ -335,8 +446,11 @@ def make_bot(label: str) -> commands.Bot:
 
             # — TT embed tweets —
             if (
-                    isMonitoringTT and msg.author.id == RICK_APP_ID
-                    and msg.channel.id == CMD_CH and msg.embeds
+                    isMonitoringTT 
+                    and label == tt_scanner_bot  # Only process if this bot is the tt scanner
+                    and msg.author.id == RICK_APP_ID
+                    and msg.channel.id == CMD_CH 
+                    and msg.embeds
             ):
                 print(msg)
                 if msg.id in processed_tt_embeds:
@@ -360,7 +474,7 @@ def make_bot(label: str) -> commands.Bot:
                 return None
 
             # — Raw tweets —
-            if msg.channel.id == TT_CH_ID and not msg.author.bot:
+            if msg.channel.id == TT_CH_ID and not msg.author.bot and label == tt_scanner_bot:  # Only process if this bot is the tt scanner
                 for m in TW_URL_RE.finditer(msg.content):
                     url = m.group(1)
                     if url in processed_tweets:
@@ -453,6 +567,10 @@ def _attach_tt_tasks(bot: commands.Bot):
                     current_interval = random.choice([180, 300, 480])
                     current_variation = random.uniform(0.1, 2.0)  # Add 0.1 to 2.0 seconds of variation
 
+                    # Rotate TT roles after successful command execution
+                    rotate_tt_roles()
+                    log.info("[TT_LOOP] Rotated TT roles after command execution")
+
                     tt_fails = 0
                     update_hb()                                   # successful loop
             else:
@@ -516,6 +634,10 @@ def _attach_burp_tasks(bot: commands.Bot):
                     # Select a new variation for the next run
                     current_variation = random.uniform(5.0, 30.0)  # Add 5 to 30 seconds of variation
 
+                    # Rotate BURP roles after successful command execution
+                    rotate_burp_roles()
+                    log.info("[BURP_LOOP] Rotated BURP roles after command execution")
+
                     burp_fails = 0
                     update_hb()                                   # successful loop
             else:
@@ -542,6 +664,40 @@ async def runner(token, label):
         except (*NET_ERR, Exception) as e:
             log.warning("[%s] error %r — restart in 5 s", label, e)
         finally:
+            # Remove this bot from active bots
+            global active_bots, tt_command_bot, tt_scanner_bot, burp_command_bot, burp_scanner_bot
+
+            if label in active_bots:
+                active_bots.remove(label)
+                log.info("[%s] removed from active bots", label)
+
+                # If this bot was assigned to any role, we need to reassign roles
+                roles_changed = False
+
+                if tt_command_bot == label:
+                    tt_command_bot = None
+                    roles_changed = True
+                    log.info("[%s] was TT command bot, role now unassigned", label)
+
+                if tt_scanner_bot == label:
+                    tt_scanner_bot = None
+                    roles_changed = True
+                    log.info("[%s] was TT scanner bot, role now unassigned", label)
+
+                if burp_command_bot == label:
+                    burp_command_bot = None
+                    roles_changed = True
+                    log.info("[%s] was BURP command bot, role now unassigned", label)
+
+                if burp_scanner_bot == label:
+                    burp_scanner_bot = None
+                    roles_changed = True
+                    log.info("[%s] was BURP scanner bot, role now unassigned", label)
+
+                # If roles changed, try to reassign them
+                if roles_changed:
+                    initialize_roles_if_needed()
+
             try: await bot.close()
             except Exception: pass
             await asyncio.sleep(5)
