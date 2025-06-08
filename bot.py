@@ -10,9 +10,9 @@ from datetime import UTC
 from dotenv import load_dotenv
 
 import discord
-from discord import HTTPException
+from discord import HTTPException, Embed
 from discord.ext import commands, tasks
-from discord.http import HTTPClient
+from discord.http import HTTPClient, Route
 from discord.utils import MISSING
 from curl_cffi.curl import CurlError
 import aiohttp
@@ -77,6 +77,9 @@ processed_tt_embeds, processed_tweets = set(), set()
 burp_cycle_processed = set()
 last_trending_time, last_burp_time = 0.0, 0.0
 
+# Dictionary to store bot instances by label
+bot_instances = {}
+
 # Role rotation tracking
 tt_command_bot = None  # Bot that sends /tt commands
 tt_scanner_bot = None  # Bot that scans and forwards tweets
@@ -96,6 +99,10 @@ ALLOWED_AUTHORS = {
     219212900743512065, # Simple
     303754867044777985, # Dej
     979973170251567136, # Kit
+    366245216174342144,
+    402836835627302922,
+    290597129016311809,
+    358568364375015424,
 }
 
 NET_ERR = (
@@ -108,6 +115,34 @@ TOKEN_RE  = re.compile(r"(0x[a-fA-F0-9]{40}|[A-Za-z0-9]+)$")
 
 async def safe_command_call(cmd, channel, guild, max_retries=3):
     """Safely call a Discord command with retry mechanism."""
+    # Static variables to track last call times
+    if not hasattr(safe_command_call, "last_tt_call"):
+        safe_command_call.last_tt_call = 0
+    if not hasattr(safe_command_call, "last_burp_call"):
+        safe_command_call.last_burp_call = 0
+
+    # Check if this is a tt or burp command
+    cmd_name = getattr(cmd, "name", "").lower()
+    current_time = time.time()
+
+    # Enforce cooldown for tt commands (3 minutes = 180 seconds)
+    if cmd_name == "tt":
+        time_since_last_call = current_time - safe_command_call.last_tt_call
+        if time_since_last_call < 180:  # 3 minutes
+            log.warning("[COMMAND_CALL] Discarding tt command - called too soon (%.2f seconds since last call, minimum is 180 seconds)",
+                       time_since_last_call)
+            return None
+        safe_command_call.last_tt_call = current_time
+
+    # Enforce cooldown for burp commands (10 minutes = 600 seconds)
+    elif cmd_name == "burp":
+        time_since_last_call = current_time - safe_command_call.last_burp_call
+        if time_since_last_call < 600:  # 10 minutes
+            log.warning("[COMMAND_CALL] Discarding burp command - called too soon (%.2f seconds since last call, minimum is 600 seconds)",
+                       time_since_last_call)
+            return None
+        safe_command_call.last_burp_call = current_time
+
     retries = 0
     last_error = None
 
@@ -149,6 +184,9 @@ def rotate_tt_roles():
     """Rotate which bots handle TT commands and scanning."""
     global tt_command_bot, tt_scanner_bot, active_bots
 
+    # Store old command bot for later
+    old_command_bot = tt_command_bot
+
     # Get available command candidates (excluding current scanner bot)
     available_cmd_bots = [bot for bot in tt_command_candidates if bot in active_bots and bot != tt_scanner_bot]
 
@@ -172,12 +210,36 @@ def rotate_tt_roles():
             tt_scanner_bot = available_scan_bots[0]
 
         log.info("[TT_ROTATION] New roles - Command: %s, Scanner: %s", tt_command_bot, tt_scanner_bot)
+
+        # If command bot changed, transfer tasks to the new bot
+        if old_command_bot != tt_command_bot:
+            # Use bot_instances dictionary instead of discord.client._clients
+            # Reset the _tt_started flag on the old bot if it exists
+            if old_command_bot in bot_instances:
+                old_bot = bot_instances[old_command_bot]
+                # Stop the task loop if it exists
+                if hasattr(old_bot, '_tt_loop') and old_bot._tt_loop.is_running():
+                    old_bot._tt_loop.cancel()
+                    log.info("[%s] TT command task loop stopped", old_command_bot)
+                old_bot._tt_started = False
+                log.info("[%s] TT command tasks detached from old bot", old_command_bot)
+
+            # Attach tasks to the new command bot
+            if tt_command_bot in bot_instances:
+                new_bot = bot_instances[tt_command_bot]
+                # Reset the flag first to ensure tasks are attached
+                new_bot._tt_started = False
+                _attach_tt_tasks(new_bot)
+                log.info("[%s] TT command tasks transferred to new bot", tt_command_bot)
     else:
         log.warning("[TT_ROTATION] Not enough available bots for rotation")
 
 def rotate_burp_roles():
     """Rotate which bots handle BURP commands and scanning."""
     global burp_command_bot, burp_scanner_bot, active_bots
+
+    # Store old command bot for later
+    old_command_bot = burp_command_bot
 
     # Get available command candidates (excluding current scanner bot)
     available_cmd_bots = [bot for bot in burp_command_candidates if bot in active_bots and bot != burp_scanner_bot]
@@ -202,6 +264,27 @@ def rotate_burp_roles():
             burp_scanner_bot = available_scan_bots[0]
 
         log.info("[BURP_ROTATION] New roles - Command: %s, Scanner: %s", burp_command_bot, burp_scanner_bot)
+
+        # If command bot changed, transfer tasks to the new bot
+        if old_command_bot != burp_command_bot:
+            # Use bot_instances dictionary instead of discord.client._clients
+            # Reset the _burp_started flag on the old bot if it exists
+            if old_command_bot in bot_instances:
+                old_bot = bot_instances[old_command_bot]
+                # Stop the task loop if it exists
+                if hasattr(old_bot, '_burp_loop') and old_bot._burp_loop.is_running():
+                    old_bot._burp_loop.cancel()
+                    log.info("[%s] BURP command task loop stopped", old_command_bot)
+                old_bot._burp_started = False
+                log.info("[%s] BURP command tasks detached from old bot", old_command_bot)
+
+            # Attach tasks to the new command bot
+            if burp_command_bot in bot_instances:
+                new_bot = bot_instances[burp_command_bot]
+                # Reset the flag first to ensure tasks are attached
+                new_bot._burp_started = False
+                _attach_burp_tasks(new_bot)
+                log.info("[%s] BURP command tasks transferred to new bot", burp_command_bot)
     else:
         log.warning("[BURP_ROTATION] Not enough available bots for rotation")
 
@@ -217,8 +300,8 @@ def initialize_roles_if_needed():
         if available_cmd_bots and available_scan_bots:
             tt_command_bot = available_cmd_bots[0]
             tt_scanner_bot = available_scan_bots[0]
-            log.info("[INIT_ROLES] TT roles initialized - Command: %s, Scanner: %s", 
-                    tt_command_bot, tt_scanner_bot)
+            log.info("[INIT_ROLES] TT roles initialized - Command: %s, Scanner: %s (active_bots: %s)", 
+                    tt_command_bot, tt_scanner_bot, active_bots)
 
     # Initialize BURP roles if needed
     if (burp_command_bot is None or burp_scanner_bot is None) and len(active_bots) >= 2:
@@ -228,13 +311,17 @@ def initialize_roles_if_needed():
         if available_cmd_bots and available_scan_bots:
             burp_command_bot = available_cmd_bots[0]
             burp_scanner_bot = available_scan_bots[0]
-            log.info("[INIT_ROLES] BURP roles initialized - Command: %s, Scanner: %s", 
-                    burp_command_bot, burp_scanner_bot)
+            log.info("[INIT_ROLES] BURP roles initialized - Command: %s, Scanner: %s (active_bots: %s)", 
+                    burp_command_bot, burp_scanner_bot, active_bots)
 
 # ── BOT FACTORY ───────────────────────────────────────────────────────────
 def make_bot(label: str) -> commands.Bot:
     bot = commands.Bot(command_prefix="!", self_bot=True)
     bot.label = label
+
+    # Add bot to bot_instances dictionary
+    global bot_instances
+    bot_instances[label] = bot
 
     @bot.event
     async def on_ready():
@@ -248,16 +335,53 @@ def make_bot(label: str) -> commands.Bot:
         # Initialize roles if needed
         initialize_roles_if_needed()
 
-        # Attach TT tasks if this bot is the current TT command bot
-        if label == tt_command_bot and not getattr(bot, "_tt_started", False):
-            _attach_tt_tasks(bot)
-            log.info("[%s] selected for TT command tasks", label)
+        # Schedule a task to check and attach tasks after a short delay
+        # This ensures roles are initialized before we check if this bot should attach tasks
+        asyncio.create_task(check_and_attach_tasks(bot, label))
 
-        # Attach BURP tasks if this bot is the current BURP command bot
-        if label == burp_command_bot and not getattr(bot, "_burp_started", False):
-            bot._burp_started = True
-            _attach_burp_tasks(bot)
-            log.info("[%s] selected for BURP command tasks", label)
+    async def check_and_attach_tasks(bot, label, max_retries=5, retry_delay=1.0):
+        """Check if this bot should attach tasks and do so if needed.
+        Retry a few times to ensure roles are initialized."""
+        global tt_command_bot, burp_command_bot
+
+        for retry in range(max_retries):
+            # Initialize roles again in case they weren't initialized yet
+            initialize_roles_if_needed()
+
+            # Check if roles are assigned
+            if tt_command_bot is None or burp_command_bot is None:
+                log.debug("[%s] Roles not fully initialized yet, retry %d/%d (tt_command_bot=%s, burp_command_bot=%s)", 
+                         label, retry + 1, max_retries, tt_command_bot, burp_command_bot)
+                await asyncio.sleep(retry_delay)
+                continue
+
+            # Attach TT tasks if this bot is the current TT command bot
+            if label == tt_command_bot and not getattr(bot, "_tt_started", False):
+                _attach_tt_tasks(bot)
+                log.info("[%s] selected for TT command tasks (retry %d)", label, retry)
+
+            # Attach BURP tasks if this bot is the current BURP command bot
+            if label == burp_command_bot and not getattr(bot, "_burp_started", False):
+                _attach_burp_tasks(bot)
+                log.info("[%s] selected for BURP command tasks (retry %d)", label, retry)
+
+            # If we got here, we've checked and potentially attached tasks
+            log.debug("[%s] Successfully checked and attached tasks (retry %d)", label, retry)
+            return
+
+        # If we've exhausted retries and roles still aren't initialized
+        if tt_command_bot is None or burp_command_bot is None:
+            log.warning("[%s] Failed to initialize roles after %d retries", 
+                       label, max_retries)
+        else:
+            # Final check in case roles were initialized on the last retry
+            if label == tt_command_bot and not getattr(bot, "_tt_started", False):
+                _attach_tt_tasks(bot)
+                log.info("[%s] selected for TT command tasks (final check)", label)
+
+            if label == burp_command_bot and not getattr(bot, "_burp_started", False):
+                _attach_burp_tasks(bot)
+                log.info("[%s] selected for BURP command tasks (final check)", label)
 
     # ── Handlers for scanning bots ──────────────────────────────────────────────
     # Check if this bot is assigned to scanner role for either TT or BURP
@@ -324,7 +448,7 @@ def make_bot(label: str) -> commands.Bot:
             if (
                     isMonitoringTT 
                     and label == tt_scanner_bot  # Only process if this bot is the tt scanner
-                    and after.author.id == RICK_APP_ID 
+                    and after.author.id == RICK_APP_ID
                     and after.channel.id == CMD_CH
             ):
                 if after.id in processed_tt_embeds:
@@ -343,7 +467,7 @@ def make_bot(label: str) -> commands.Bot:
                     processed_tweets.add(url)
                     log.info("[%s] Forwarding tweet: %s", label, url)
                     # Add variation between 1 and 15 seconds
-                    await asyncio.sleep(random.uniform(1, 15))
+                    await asyncio.sleep(random.uniform(10, 35))
                     await bot.get_channel(X_CH_ID).send(url)
                 return None
             return None
@@ -362,6 +486,12 @@ def make_bot(label: str) -> commands.Bot:
             if msg.channel.id == TT_CH_ID and msg.author.id in ALLOWED_AUTHORS:
                 if txt == "tt start":
                     isMonitoringTT = True
+                    # Restart TT tasks on the current command bot
+                    if label == tt_command_bot:
+                        # Reset the flag to ensure tasks are attached
+                        bot._tt_started = False
+                        _attach_tt_tasks(bot)
+                        log.info("[%s] TT tasks restarted after 'tt start' command", label)
                     return await msg.channel.send("TT on")
                 if txt == "tt stop":
                     isMonitoringTT = False
@@ -380,6 +510,12 @@ def make_bot(label: str) -> commands.Bot:
             if msg.channel.id == BURP_CH_ID and msg.author.id in ALLOWED_AUTHORS:
                 if txt == "burp start":
                     isMonitoringBurp = True
+                    # Restart BURP tasks on the current command bot
+                    if label == burp_command_bot:
+                        # Reset the flag to ensure tasks are attached
+                        bot._burp_started = False
+                        _attach_burp_tasks(bot)
+                        log.info("[%s] BURP tasks restarted after 'burp start' command", label)
                     return await msg.channel.send("Burp on")
                 if txt == "burp stop":
                     isMonitoringBurp = False
@@ -469,7 +605,7 @@ def make_bot(label: str) -> commands.Bot:
                     processed_tweets.add(url)
                     log.info("Forwarding tweet: %s", url)
                     # Add variation between 1 and 15 seconds
-                    await asyncio.sleep(random.uniform(1, 15))
+                    await asyncio.sleep(random.uniform(10, 35))
                     await bot.get_channel(X_CH_ID).send(url)
                 return None
 
@@ -486,8 +622,8 @@ def make_bot(label: str) -> commands.Bot:
                     cname = "CALL" if dest == CALL_CH_ID else "X"
                     log.info("Forwarding tweet to %s: %s", cname, url)
 
-                    # Add variation between 1 and 15 seconds
-                    await asyncio.sleep(random.uniform(1, 15))
+                    # Add variation between 10 and 35 seconds
+                    await asyncio.sleep(random.uniform(10, 35))
                     await bot.get_channel(dest).send(url)
                     return None
                 return None
@@ -521,11 +657,12 @@ def _attach_tt_tasks(bot: commands.Bot):
     """Attach trending topics tasks to the bot."""
     bot._tt_started = True
     global last_trending_time
+    log.info("[%s] Attaching TT tasks - loop will start momentarily", bot.label)
 
     recreate_http = _recreate_http(bot)
     tt_fails = 0
     # Store the current interval and variation
-    current_interval = random.choice([60, 180, 300])
+    current_interval = random.choice([180, 300, 480])
     current_variation = random.uniform(0.1, 2.0)
 
     @tasks.loop(seconds=1)  # We'll handle the interval manually
@@ -533,7 +670,8 @@ def _attach_tt_tasks(bot: commands.Bot):
         nonlocal tt_fails, current_interval, current_variation
         global last_trending_time
         try:
-            if not isMonitoringTT or bot.is_closed():
+            # Check if this bot is still the command bot and monitoring is active
+            if not isMonitoringTT or bot.is_closed() or not getattr(bot, "_tt_started", False) or tt_command_bot != bot.label:
                 return
 
             current_time = time.time()
@@ -542,7 +680,7 @@ def _attach_tt_tasks(bot: commands.Bot):
                      last_trending_time, current_time, current_time - last_trending_time, current_interval, current_variation)
 
             if current_time - last_trending_time < COMMAND_DELAY:
-                log.debug("[TT_LOOP] Skipping due to COMMAND_DELAY: diff=%.2f < %d", 
+                log.debug("[TT_LOOP] Skipping due to COMMAND_DELAY: diff=%.2f < %d",
                          current_time - last_trending_time, COMMAND_DELAY)
                 return
 
@@ -550,31 +688,36 @@ def _attach_tt_tasks(bot: commands.Bot):
             time_diff = current_time - last_trending_time
             threshold = current_interval + current_variation
             if last_trending_time == 0 or time_diff >= threshold:
-                log.debug("[TT_LOOP] Condition met: last_trending_time=%s, time_diff=%.2f, threshold=%.2f", 
+                log.debug("[TT_LOOP] Condition met: last_trending_time=%s, time_diff=%.2f, threshold=%.2f",
                          "0" if last_trending_time == 0 else "%.2f" % last_trending_time, time_diff, threshold)
                 # Execute the command
                 ch = await bot.fetch_channel(CMD_CH)
                 cmd = discord.utils.get(await safe_fetch_commands(ch), name="tt")
                 if cmd:
                     # Log the interval that was used
-                    log.info("[TT_LOOP] fired /tt in #%s with interval %ds+%.2fs", ch.name, current_interval, current_variation)
-                    await safe_command_call(cmd, ch, ch.guild)
+                    log.info("[TT_LOOP] firing /tt in #%s with interval %ds+%.2fs", ch.name, current_interval, current_variation)
+                    result = await safe_command_call(cmd, ch, ch.guild)
+                    #await bot.get_channel(TT_CH_ID).send("tt test")
 
-                    # Update the last trending time
-                    last_trending_time = current_time
+                    # Only update state if the command was actually executed (not discarded)
+                    if result is not None:
+                        # Update the last trending time
+                        last_trending_time = current_time
 
-                    # Select a new interval and variation for the next run
-                    current_interval = random.choice([180, 300, 480])
-                    current_variation = random.uniform(0.1, 2.0)  # Add 0.1 to 2.0 seconds of variation
+                        # Select a new interval and variation for the next run
+                        current_interval = random.choice([180, 300, 480])
+                        current_variation = random.uniform(0.1, 2.0)  # Add 0.1 to 2.0 seconds of variation
 
-                    # Rotate TT roles after successful command execution
-                    rotate_tt_roles()
-                    log.info("[TT_LOOP] Rotated TT roles after command execution")
+                        # Rotate TT roles after successful command execution
+                        rotate_tt_roles()
+                        log.info("[TT_LOOP] Rotated TT roles after command execution")
 
-                    tt_fails = 0
-                    update_hb()                                   # successful loop
+                        tt_fails = 0
+                        update_hb()                                   # successful loop
+                    else:
+                        log.info("[TT_LOOP] Command was discarded due to cooldown, not updating state")
             else:
-                log.debug("[TT_LOOP] Condition not met: time_diff=%.2f < threshold=%.2f, waiting...", 
+                log.debug("[TT_LOOP] Condition not met: time_diff=%.2f < threshold=%.2f, waiting...",
                          time_diff, threshold)
         except NET_ERR as e:
             tt_fails += 1
@@ -584,12 +727,15 @@ def _attach_tt_tasks(bot: commands.Bot):
                 log.critical("[TT_LOOP] %s fails — hard exit", FAIL_THRESHOLD)
                 os._exit(1)
 
+    # Store the task loop in the bot instance so it can be accessed later
+    bot._tt_loop = tt_loop
     tt_loop.start()
 
 def _attach_burp_tasks(bot: commands.Bot):
     """Attach burp tasks to the bot."""
     bot._burp_started = True
     global last_burp_time
+    log.info("[%s] Attaching BURP tasks - loop will start momentarily", bot.label)
 
     recreate_http = _recreate_http(bot)
     burp_fails = 0
@@ -601,7 +747,8 @@ def _attach_burp_tasks(bot: commands.Bot):
         nonlocal burp_fails, current_variation
         global last_burp_time
         try:
-            if not isMonitoringBurp or bot.is_closed():
+            # Check if this bot is still the command bot and monitoring is active
+            if not isMonitoringBurp or bot.is_closed() or not getattr(bot, "_burp_started", False) or burp_command_bot != bot.label:
                 return
 
             current_time = time.time()
@@ -610,7 +757,7 @@ def _attach_burp_tasks(bot: commands.Bot):
                      last_burp_time, current_time, current_time - last_burp_time, BURP_COOLDOWN, current_variation)
 
             if current_time - last_burp_time < BURP_COOLDOWN:
-                log.debug("[BURP_LOOP] Skipping due to BURP_COOLDOWN: diff=%.2f < %d", 
+                log.debug("[BURP_LOOP] Skipping due to BURP_COOLDOWN: diff=%.2f < %d",
                          current_time - last_burp_time, BURP_COOLDOWN)
                 return
 
@@ -618,30 +765,35 @@ def _attach_burp_tasks(bot: commands.Bot):
             time_diff = current_time - last_burp_time
             threshold = BURP_COOLDOWN + current_variation
             if last_burp_time == 0 or time_diff >= threshold:
-                log.debug("[BURP_LOOP] Condition met: last_burp_time=%s, time_diff=%.2f, threshold=%.2f", 
+                log.debug("[BURP_LOOP] Condition met: last_burp_time=%s, time_diff=%.2f, threshold=%.2f",
                          "0" if last_burp_time == 0 else "%.2f" % last_burp_time, time_diff, threshold)
                 # Execute the command
                 ch = await bot.fetch_channel(BURP_CH_ID)
                 cmd = discord.utils.get(await safe_fetch_commands(ch), name="burp")
                 if cmd:
                     # Log the cooldown that was used
-                    log.info("[BURP_LOOP] fired /burp in #%s with cooldown %ds+%.2fs", ch.name, BURP_COOLDOWN, current_variation)
-                    await safe_command_call(cmd, ch, ch.guild)
+                    log.info("[BURP_LOOP] firing /burp in #%s with cooldown %ds+%.2fs", ch.name, BURP_COOLDOWN, current_variation)
+                    result = await safe_command_call(cmd, ch, ch.guild)
+                    #await bot.get_channel(BURP_CH_ID).send("burp test")
 
-                    # Update the last burp time
-                    last_burp_time = current_time
+                    # Only update state if the command was actually executed (not discarded)
+                    if result is not None:
+                        # Update the last burp time
+                        last_burp_time = current_time
 
-                    # Select a new variation for the next run
-                    current_variation = random.uniform(5.0, 30.0)  # Add 5 to 30 seconds of variation
+                        # Select a new variation for the next run
+                        current_variation = random.uniform(5.0, 30.0)  # Add 5 to 30 seconds of variation
 
-                    # Rotate BURP roles after successful command execution
-                    rotate_burp_roles()
-                    log.info("[BURP_LOOP] Rotated BURP roles after command execution")
+                        # Rotate BURP roles after successful command execution
+                        rotate_burp_roles()
+                        log.info("[BURP_LOOP] Rotated BURP roles after command execution")
 
-                    burp_fails = 0
-                    update_hb()                                   # successful loop
+                        burp_fails = 0
+                        update_hb()                                   # successful loop
+                    else:
+                        log.info("[BURP_LOOP] Command was discarded due to cooldown, not updating state")
             else:
-                log.debug("[BURP_LOOP] Condition not met: time_diff=%.2f < threshold=%.2f, waiting...", 
+                log.debug("[BURP_LOOP] Condition not met: time_diff=%.2f < threshold=%.2f, waiting...",
                          time_diff, threshold)
         except NET_ERR as e:
             burp_fails += 1
@@ -651,6 +803,8 @@ def _attach_burp_tasks(bot: commands.Bot):
                 log.critical("[BURP_LOOP] %s fails — hard exit", FAIL_THRESHOLD)
                 os._exit(1)
 
+    # Store the task loop in the bot instance so it can be accessed later
+    bot._burp_loop = burp_loop
     burp_loop.start()
 
 # ── RUNNER loop ───────────────────────────────────────────────────────────
@@ -664,12 +818,29 @@ async def runner(token, label):
         except (*NET_ERR, Exception) as e:
             log.warning("[%s] error %r — restart in 5 s", label, e)
         finally:
-            # Remove this bot from active bots
-            global active_bots, tt_command_bot, tt_scanner_bot, burp_command_bot, burp_scanner_bot
+            # Remove this bot from active bots and bot_instances
+            global active_bots, tt_command_bot, tt_scanner_bot, burp_command_bot, burp_scanner_bot, bot_instances
 
             if label in active_bots:
                 active_bots.remove(label)
                 log.info("[%s] removed from active bots", label)
+
+            # Remove from bot_instances dictionary
+            if label in bot_instances:
+                # Stop any running task loops before removing the bot
+                bot_instance = bot_instances[label]
+
+                # Stop TT task loop if it exists and is running
+                if hasattr(bot_instance, '_tt_loop') and bot_instance._tt_loop.is_running():
+                    bot_instance._tt_loop.cancel()
+                    log.info("[%s] TT command task loop stopped on disconnect", label)
+
+                # Stop BURP task loop if it exists and is running
+                if hasattr(bot_instance, '_burp_loop') and bot_instance._burp_loop.is_running():
+                    bot_instance._burp_loop.cancel()
+                    log.info("[%s] BURP command task loop stopped on disconnect", label)
+
+                del bot_instances[label]
 
                 # If this bot was assigned to any role, we need to reassign roles
                 roles_changed = False
