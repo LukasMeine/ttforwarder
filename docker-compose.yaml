@@ -1,60 +1,25 @@
+version: '3.8'
 
-function verifica_arq_sadm($uuid_user, $n, $tipo = '')
-{
-    try {
-        $strategy = match ((int)$n) {
-            DOC_CNH_RG => [
-                [ "{$uuid_user}__1." ],
-                'Visualizar CNH ou RG',
-                'file1'
-            ],
-            DOC_CRM => [
-                [ "{$uuid_user}__2." ],
-                'Visualizar CRM',
-                'file2'
-            ],
-            DOC_ESPECIALIDADE1 => [
-                [ "{$uuid_user}__rqe1.", "{$uuid_user}__3." ],
-                'Visualizar ' . get_name_tipo_doc($tipo) . ' - Especialidade 1',
-                'file3'
-            ],
-            DOC_ESPECIALIDADE2 => [
-                [ "{$uuid_user}__rqe2.", "{$uuid_user}__4." ],
-                'Visualizar ' . get_name_tipo_doc($tipo) . ' - Especialidade 2',
-                'file4'
-            ],
-            default => null
-        };
+services:
+  ttforwarder:
+    build: .
+    env_file: .env
+    restart: always
+    healthcheck:
+      test: ["CMD", "python", "healthcheck.py"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    labels:
+      autoheal: "true"
 
-        if (!$strategy) return null;
-
-        list($prefixes, $txt, $campoHistorico) = $strategy;
-
-        $arquivoHistorico = get_arquivo_historico($uuid_user, $campoHistorico);
-
-        if ($arquivoHistorico) {
-            foreach ($prefixes as $prefix) {
-                if (in_array($arquivoHistorico, listBlobsInContainer(BLOBDOCUMENTOS, $prefix))) {
-                    return gerar_link_documento($arquivoHistorico, $txt);
-                }
-            }
-        }
-
-        foreach ($prefixes as $prefix) {
-            $files = listBlobsInContainer(BLOBDOCUMENTOS, $prefix);
-            if (count($files) === 1) {
-                return gerar_link_documento($files[0], $txt);
-            }
-
-            if (count($files) > 1) {
-                cria_log($_SESSION['login']['uuid'] ?? '', "75", "erro_documento_profissional", "Mais de um arquivo encontrado para prefixo $prefix sem histórico válido");
-                return null;
-            }
-        }
-        return null;
-
-    } catch (Exception $e) {
-        cria_log($_SESSION['login']['uuid'] ?? '', "75", "erro_documento_profissional", $e->getMessage());
-        return null;
-    }
-}
+  autoheal:
+    image: willfarrell/autoheal
+    container_name: autoheal
+    restart: always
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=30
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
