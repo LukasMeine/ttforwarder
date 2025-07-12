@@ -8,6 +8,8 @@
 import os, re, random, asyncio, time, sys, socket, ssl, inspect, logging, pathlib, datetime
 from datetime import UTC
 from dotenv import load_dotenv
+import logging
+from collections import deque
 
 import discord
 from discord import HTTPException, Embed
@@ -17,6 +19,7 @@ from discord.utils import MISSING
 from curl_cffi.curl import CurlError
 import aiohttp
 
+log = logging.getLogger("ttforwarder")
 load_dotenv()
 
 # ── HEART-BEAT (for Docker health-check) ──────────────────────────────────
@@ -67,6 +70,7 @@ COMMAND_DELAY    = int(os.getenv("COMMAND_DELAY", "30"))  # Increased from 15 to
 COPY_DELAY_MIN   = int(os.getenv("COPY_DELAY_MIN", "5"))  # Increased from 3 to 5
 COPY_DELAY_MAX   = int(os.getenv("COPY_DELAY_MAX", "15")) # Increased from 5 to 15
 BURP_COOLDOWN    = int(os.getenv("BURP_COOLDOWN", "600"))
+TEST_MODE        = os.getenv("TEST_MODE", "false").lower() == "true"  # Convert string to boolean
 
 FAIL_THRESHOLD   = 3   # after N consecutive REST failures → os._exit(1)
 
@@ -76,6 +80,34 @@ isMonitoringBurp = True
 processed_tt_embeds, processed_tweets = set(), set()
 burp_cycle_processed = set()
 last_trending_time, last_burp_time = 0.0, 0.0
+
+# ── STATE PERSISTENCE FUNCTIONS ───────────────────────────────────────────
+def save_state():
+    """Save the current monitoring state to server_state.txt"""
+    try:
+        with open("server_state.txt", "w") as f:
+            f.write(f"isMonitoringTT={isMonitoringTT}\n")
+            f.write(f"isMonitoringBurp={isMonitoringBurp}\n")
+        log.info("Server state saved to server_state.txt")
+    except Exception as e:
+        log.error(f"Failed to save server state: {e}")
+
+def load_state():
+    """Load the monitoring state from server_state.txt if it exists"""
+    global isMonitoringTT, isMonitoringBurp
+    try:
+        if os.path.exists("server_state.txt"):
+            with open("server_state.txt", "r") as f:
+                for line in f:
+                    if line.startswith("isMonitoringTT="):
+                        isMonitoringTT = line.strip().split("=")[1].lower() == "true"
+                    elif line.startswith("isMonitoringBurp="):
+                        isMonitoringBurp = line.strip().split("=")[1].lower() == "true"
+            log.info(f"Server state loaded: TT={isMonitoringTT}, Burp={isMonitoringBurp}")
+        else:
+            log.info("No server_state.txt found, using default state")
+    except Exception as e:
+        log.error(f"Failed to load server state: {e}")
 
 # Dictionary to store bot instances by label
 bot_instances = {}
@@ -113,53 +145,150 @@ NET_ERR = (
 TW_URL_RE = re.compile(r"(https?://twitter\.com/[^\s\)\]]+)")
 TOKEN_RE  = re.compile(r"(0x[a-fA-F0-9]{40}|[A-Za-z0-9]+)$")
 
-async def safe_command_call(cmd, channel, guild, max_retries=3):
-    """Safely call a Discord command with retry mechanism."""
-    # Static variables to track last call times
-    if not hasattr(safe_command_call, "last_tt_call"):
-        safe_command_call.last_tt_call = 0
-    if not hasattr(safe_command_call, "last_burp_call"):
-        safe_command_call.last_burp_call = 0
+# Command queue for producer-consumer pattern
+command_queue = asyncio.Queue()
 
-    # Check if this is a tt or burp command
-    cmd_name = getattr(cmd, "name", "").lower()
-    current_time = time.time()
+async def _command_consumer():
+    """Single consumer that processes commands from the queue and enforces tt/burp cooldowns."""
+    last_tt_call   = 0.0
+    last_burp_call = 0.0
 
-    # Enforce cooldown for tt commands (3 minutes = 180 seconds)
-    if cmd_name == "tt":
-        time_since_last_call = current_time - safe_command_call.last_tt_call
-        if time_since_last_call < 180:  # 3 minutes
-            log.warning("[COMMAND_CALL] Discarding tt command - called too soon (%.2f seconds since last call, minimum is 180 seconds)",
-                       time_since_last_call)
-            return None
-        safe_command_call.last_tt_call = current_time
+    while True:
+        # small pause so we don't busy-spin
+        await asyncio.sleep(0.5)
 
-    # Enforce cooldown for burp commands (10 minutes = 600 seconds)
-    elif cmd_name == "burp":
-        time_since_last_call = current_time - safe_command_call.last_burp_call
-        if time_since_last_call < 600:  # 10 minutes
-            log.warning("[COMMAND_CALL] Discarding burp command - called too soon (%.2f seconds since last call, minimum is 600 seconds)",
-                       time_since_last_call)
-            return None
-        safe_command_call.last_burp_call = current_time
+        # ——— Pre-filter pass: only keep *one* allowed /tt and one /burp ———
+        buffer     = deque()
+        now        = time.monotonic()
+        seen_tt    = False
+        seen_burp  = False
 
-    retries = 0
-    last_error = None
+        # drain everything
+        while True:
+            try:
+                cmd0, ch0, g0, mr0, bot0, fut0 = command_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
-    while retries < max_retries:
+            name0 = getattr(cmd0, "name", "").lower()
+            if name0 == "tt":
+                # allow only the very first tt if cooldown passed
+                if not seen_tt and (now - last_tt_call) >= 180:
+                    buffer.append((cmd0, ch0, g0, mr0, bot0, fut0))
+                    seen_tt = True
+                else:
+                    # drop all others immediately
+                    log.debug("[PRE-CONSUMER] Dropping extra /tt (cooldown or duplicate)")
+                    fut0.set_result(None)
+                command_queue.task_done()
+
+            elif name0 == "burp":
+                # allow only the very first burp if cooldown passed
+                if not seen_burp and (now - last_burp_call) >= 600:
+                    buffer.append((cmd0, ch0, g0, mr0, bot0, fut0))
+                    seen_burp = True
+                else:
+                    # drop extras
+                    log.debug("[PRE-CONSUMER] Dropping extra /burp (cooldown or duplicate)")
+                    fut0.set_result(None)
+                command_queue.task_done()
+
+            else:
+                # non-tt/burp commands just pass straight through
+                buffer.append((cmd0, ch0, g0, mr0, bot0, fut0))
+                command_queue.task_done()
+
+        # re-queue exactly the survivors (at most one /tt and one /burp)
+        for item in buffer:
+            await command_queue.put(item)
+
+        # ——— Now pull the one command to execute (if any) ———
+        cmd_tuple = await command_queue.get()
+        cmd, channel, guild, max_retries, client_bot, future = cmd_tuple
+
         try:
-            return await cmd.__call__(channel=channel, guild=guild)
-        except NET_ERR as e:
-            last_error = e
-            retries += 1
-            backoff = min(2 ** retries, 60)  # Exponential backoff, max 60 seconds
-            log.warning("[COMMAND_CALL] %r, retrying in %s seconds (%s/%s)", 
-                       e, backoff, retries, max_retries)
-            await asyncio.sleep(backoff)
+            cmd_name     = getattr(cmd, "name", "").lower()
+            current_time = time.monotonic()
 
-    # If we've exhausted retries, raise the last exception
-    log.error("[COMMAND_CALL] Failed after %s retries: %r", max_retries, last_error)
-    raise last_error
+            # final safety net cooldown
+            if cmd_name == "tt":
+                if current_time - last_tt_call < 180:
+                    log.warning("[COMMAND_CALL] (post-filter) Discarding tt—too soon")
+                    future.set_result(None)
+                    continue
+                last_tt_call = current_time
+
+            elif cmd_name == "burp":
+                if current_time - last_burp_call < 600:
+                    log.warning("[COMMAND_CALL] (post-filter) Discarding burp—too soon")
+                    future.set_result(None)
+                    continue
+                last_burp_call = current_time
+
+            # ——— TEST_MODE handling ———
+            if TEST_MODE:
+                bot = client_bot or _get_bot_from_channel(channel)
+                if not bot:
+                    future.set_result({
+                        "test_mode": True,
+                        "command": cmd_name,
+                        "error": "No bot client"
+                    })
+                    continue
+
+                if cmd_name == "tt":
+                    await bot.get_channel(TT_CH_ID).send("tt test")
+                    log.info("[COMMAND_CALL] Test mode: Sent 'tt test'")
+                    future.set_result({"test_mode": True, "command": "tt"})
+                    continue
+
+                if cmd_name == "burp":
+                    await bot.get_channel(BURP_CH_ID).send("burp test")
+                    log.info("[COMMAND_CALL] Test mode: Sent 'burp test'")
+                    future.set_result({"test_mode": True, "command": "burp"})
+                    continue
+
+                log.warning("[COMMAND_CALL] Test mode: unknown command %s", cmd_name)
+
+            # ——— Normal execution with retry/backoff ———
+            retries    = 0
+            last_error = None
+            while retries < max_retries:
+                try:
+                    result = await cmd.__call__(channel=channel, guild=guild)
+                    future.set_result(result)
+                    break
+                except NET_ERR as e:
+                    last_error = e
+                    retries   += 1
+                    backoff    = min(2 ** retries, 60)
+                    log.warning(
+                        "[COMMAND_CALL] %r, retrying in %s s (%s/%s)",
+                        e, backoff, retries, max_retries
+                    )
+                    await asyncio.sleep(backoff)
+
+            if retries >= max_retries and last_error:
+                log.error("[COMMAND_CALL] Failed after %s retries: %r", max_retries, last_error)
+                future.set_exception(last_error)
+
+        except Exception as e:
+            future.set_exception(e)
+
+        finally:
+            command_queue.task_done()
+
+
+async def safe_command_call(cmd, channel, guild, max_retries=3, client_bot=None):
+    """Safely call a Discord command with retry mechanism."""
+    # Create a future to get the result
+    future = asyncio.Future()
+
+    # Enqueue the command request
+    await command_queue.put((cmd, channel, guild, max_retries, client_bot, future))
+
+    # Wait for the result
+    return await future
 
 async def safe_fetch_commands(ch, max_retries=5):
     retries = 0
@@ -486,6 +615,7 @@ def make_bot(label: str) -> commands.Bot:
             if msg.channel.id == TT_CH_ID and msg.author.id in ALLOWED_AUTHORS:
                 if txt == "tt start":
                     isMonitoringTT = True
+                    save_state()  # Save the updated state
                     # Restart TT tasks on the current command bot
                     if label == tt_command_bot:
                         # Reset the flag to ensure tasks are attached
@@ -495,6 +625,7 @@ def make_bot(label: str) -> commands.Bot:
                     return await msg.channel.send("TT on")
                 if txt == "tt stop":
                     isMonitoringTT = False
+                    save_state()  # Save the updated state
                     return await msg.channel.send("TT off")
                 if txt.startswith("tt config"):
                     _, _, cd, dmin, dmax = txt.split()[:5]
@@ -510,6 +641,7 @@ def make_bot(label: str) -> commands.Bot:
             if msg.channel.id == BURP_CH_ID and msg.author.id in ALLOWED_AUTHORS:
                 if txt == "burp start":
                     isMonitoringBurp = True
+                    save_state()  # Save the updated state
                     # Restart BURP tasks on the current command bot
                     if label == burp_command_bot:
                         # Reset the flag to ensure tasks are attached
@@ -519,6 +651,7 @@ def make_bot(label: str) -> commands.Bot:
                     return await msg.channel.send("Burp on")
                 if txt == "burp stop":
                     isMonitoringBurp = False
+                    save_state()  # Save the updated state
                     return await msg.channel.send("Burp off")
                 if txt.startswith("burp config"):
                     globals().update(BURP_COOLDOWN=int(txt.split()[2]))
@@ -663,6 +796,7 @@ def _attach_tt_tasks(bot: commands.Bot):
     tt_fails = 0
     # Store the current interval and variation
     current_interval = random.choice([180, 300, 480])
+    #current_interval = random.choice([1, 2, 3])
     current_variation = random.uniform(0.1, 2.0)
 
     @tasks.loop(seconds=1)  # We'll handle the interval manually
@@ -696,8 +830,7 @@ def _attach_tt_tasks(bot: commands.Bot):
                 if cmd:
                     # Log the interval that was used
                     log.info("[TT_LOOP] firing /tt in #%s with interval %ds+%.2fs", ch.name, current_interval, current_variation)
-                    result = await safe_command_call(cmd, ch, ch.guild)
-                    #await bot.get_channel(TT_CH_ID).send("tt test")
+                    result = await safe_command_call(cmd, ch, ch.guild, client_bot=bot)
 
                     # Only update state if the command was actually executed (not discarded)
                     if result is not None:
@@ -706,6 +839,7 @@ def _attach_tt_tasks(bot: commands.Bot):
 
                         # Select a new interval and variation for the next run
                         current_interval = random.choice([180, 300, 480])
+                        #current_interval = random.choice([1, 2, 3])
                         current_variation = random.uniform(0.1, 2.0)  # Add 0.1 to 2.0 seconds of variation
 
                         # Rotate TT roles after successful command execution
@@ -773,8 +907,7 @@ def _attach_burp_tasks(bot: commands.Bot):
                 if cmd:
                     # Log the cooldown that was used
                     log.info("[BURP_LOOP] firing /burp in #%s with cooldown %ds+%.2fs", ch.name, BURP_COOLDOWN, current_variation)
-                    result = await safe_command_call(cmd, ch, ch.guild)
-                    #await bot.get_channel(BURP_CH_ID).send("burp test")
+                    result = await safe_command_call(cmd, ch, ch.guild, client_bot=bot)
 
                     # Only update state if the command was actually executed (not discarded)
                     if result is not None:
@@ -874,6 +1007,13 @@ async def runner(token, label):
             await asyncio.sleep(5)
 
 async def main():
+    # Load the server state from file
+    load_state()
+
+    # Start the command consumer task
+    consumer_task = asyncio.create_task(_command_consumer())
+
+    # Run the bot instances
     await asyncio.gather(
         runner(TOK_TRIBEIQ, "TRIBEIQ"),
         runner(TOK_EYESINTHEHOOK, "EYESINTHEHOOK"),

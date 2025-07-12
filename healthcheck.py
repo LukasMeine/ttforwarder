@@ -10,4 +10,4 @@ try:
 except FileNotFoundError:          # no heartbeat yet (container just started)
     sys.exit(1)
 
-sys.exit(0 if age < timedelta(minutes=2) else 1)
+sys.exit(0 if age < timedelta(minutes=15) else 1)
